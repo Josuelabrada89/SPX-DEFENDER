@@ -214,50 +214,20 @@ def calculate_days_remaining(expiration):
 # ==========================================================
 
 def load_token():
-
-    if not os.path.exists(CONFIG_FILE):
-
-        raise RuntimeError(
-            "No se encontró config.txt en la misma "
-            "carpeta que spx_defender.py."
-        )
-
     try:
+        import streamlit as st
 
-        with open(
-            CONFIG_FILE,
-            "r",
-            encoding="utf-8-sig",
-        ) as config:
+        token = st.secrets.get("TRADIER_TOKEN", "")
 
-            for line in config:
+        if token:
+            return str(token).strip()
 
-                line = line.strip()
-
-                if line.startswith("TRADIER_TOKEN="):
-
-                    token = (
-                        line.split("=", 1)[1]
-                        .strip()
-                        .strip('"')
-                        .strip("'")
-                    )
-
-                    if token:
-
-                        return token
-
-    except OSError as error:
-
-        raise RuntimeError(
-            f"No se pudo leer config.txt: {error}"
-        )
+    except Exception:
+        pass
 
     raise RuntimeError(
-        "En config.txt falta una línea con "
-        "TRADIER_TOKEN=TU_API_KEY."
+        "No se encontró TRADIER_TOKEN en Streamlit Secrets."
     )
-
 
 # ==========================================================
 # CLIENTE TRADIER
