@@ -10,7 +10,7 @@ import requests
 # CONFIGURACIÓN
 # ==========================================================
 
-BASE_URL = "https://sandbox.tradier.com/v1"
+BASE_URL = "https://api.tradier.com/v1"
 
 SCRIPT_DIR = os.path.dirname(
     os.path.abspath(__file__)
