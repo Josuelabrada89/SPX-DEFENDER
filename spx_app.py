@@ -2,7 +2,9 @@ import json
 import math
 import os
 import re
+import sqlite3
 import tempfile
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from html import escape
@@ -19,6 +21,12 @@ import spx_defender as defender
 st.set_page_config(page_title="SPX Defender", page_icon="🛡️", layout="wide")
 TRADES_FILE = Path(defender.SCRIPT_DIR) / "operaciones_spx.json"
 LIVE_MARKET_REFRESH_SECONDS = 5
+LIVE_OPTION_CHAIN_REFRESH_SECONDS = 10
+AUTO_IDEA_SCAN_SECONDS = 30
+AUTO_IDEA_VIEW_REFRESH_SECONDS = 10
+AUTO_SIMULATOR_REFRESH_SECONDS = 10
+AUTO_ANALYZER_REFRESH_SECONDS = 10
+AUTO_IDEAS_DATABASE_FILE = Path(defender.SCRIPT_DIR) / "spx_defender_ideas.sqlite3"
 TRADIER_BROKERAGE_URL = "https://api.tradier.com/v1"
 TRADIER_SANDBOX_URL = "https://sandbox.tradier.com/v1"
 if st.session_state.get("tradier_connection_base_url") in {TRADIER_BROKERAGE_URL, TRADIER_SANDBOX_URL}:
@@ -437,7 +445,7 @@ def load_expirations(symbol="SPX"):
     return valid
 
 
-@st.cache_data(ttl=55, show_spinner=False)
+@st.cache_data(ttl=LIVE_OPTION_CHAIN_REFRESH_SECONDS, show_spinner=False)
 def load_chain(expiration, symbol="SPX"):
     response = get_client().get(
         "/markets/options/chains",
@@ -927,7 +935,7 @@ def save_trade(position, expiration, source="manual", symbol=None, market_contex
             "symbol": str(symbol or position.get("symbol") or selected_symbol()).upper(),
             "status": "OPEN",
             "source": source,
-            "opened_at": datetime.now().isoformat(timespec="seconds"),
+            "opened_at": market_time().replace(tzinfo=None).isoformat(timespec="seconds"),
         }
     )
     trade["initial_snapshot"] = build_trade_snapshot(trade, market_context)
@@ -941,7 +949,7 @@ def close_trade(trade_id, close_value):
     for trade in trades:
         if trade.get("id") == trade_id and trade.get("status") == "OPEN":
             trade["status"] = "CLOSED"
-            trade["closed_at"] = datetime.now().isoformat(timespec="seconds")
+            trade["closed_at"] = market_time().replace(tzinfo=None).isoformat(timespec="seconds")
             trade["close_price"] = float(close_value)
             trade["realized_pnl"] = (
                 (float(trade["credit"]) - float(close_value))
@@ -1738,6 +1746,1073 @@ def generate_ideas(
     return ideas, summary, expected, spx
 
 
+def configured_application_value(name, default=None):
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return value if value not in (None, "") else default
+
+
+class AutomaticIdeasDatabase:
+    def __init__(self):
+        self.database_url = configured_application_value("DATABASE_URL")
+        self.connection = None
+        self.backend = "postgresql" if self.database_url else "sqlite"
+
+    def __enter__(self):
+        if self.database_url:
+            try:
+                import psycopg
+                from psycopg.rows import dict_row
+            except ImportError as error:
+                raise RuntimeError(
+                    "DATABASE_URL está configurada, pero falta instalar psycopg[binary]. "
+                    "Agrégalo al archivo requirements.txt."
+                ) from error
+            self.connection = psycopg.connect(
+                str(self.database_url), row_factory=dict_row, connect_timeout=10
+            )
+        else:
+            configured_path = configured_application_value(
+                "SPX_DEFENDER_DATABASE", str(AUTO_IDEAS_DATABASE_FILE)
+            )
+            database_path = Path(str(configured_path)).expanduser()
+            database_path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(str(database_path), timeout=20)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA busy_timeout = 20000")
+            try:
+                self.connection.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.OperationalError:
+                pass
+
+        self._initialize_schema()
+        return self
+
+    def __exit__(self, exception_type, exception, traceback):
+        if self.connection is None:
+            return False
+        try:
+            if exception_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+        return False
+
+    def execute(self, statement, parameters=()):
+        sql = statement.replace("?", "%s") if self.backend == "postgresql" else statement
+        return self.connection.execute(sql, tuple(parameters))
+
+    def query(self, statement, parameters=()):
+        return [dict(row) for row in self.execute(statement, parameters).fetchall()]
+
+    def _initialize_schema(self):
+        self.execute(
+            """
+            CREATE TABLE IF NOT EXISTS automatic_trade_ideas (
+                id TEXT PRIMARY KEY,
+                signature TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                trading_day TEXT NOT NULL,
+                expiration TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                closed_at TEXT,
+                status TEXT NOT NULL,
+                contracts INTEGER NOT NULL,
+                short_strike DOUBLE PRECISION NOT NULL,
+                long_strike DOUBLE PRECISION NOT NULL,
+                secondary_short_strike DOUBLE PRECISION,
+                secondary_long_strike DOUBLE PRECISION,
+                entry_credit DOUBLE PRECISION NOT NULL,
+                current_debit DOUBLE PRECISION NOT NULL,
+                max_profit DOUBLE PRECISION NOT NULL,
+                max_risk DOUBLE PRECISION NOT NULL,
+                entry_spot DOUBLE PRECISION NOT NULL,
+                current_spot DOUBLE PRECISION NOT NULL,
+                current_pnl DOUBLE PRECISION NOT NULL,
+                realized_pnl DOUBLE PRECISION,
+                score DOUBLE PRECISION NOT NULL,
+                confidence DOUBLE PRECISION NOT NULL,
+                delta DOUBLE PRECISION NOT NULL,
+                gamma DOUBLE PRECISION NOT NULL,
+                target_profit DOUBLE PRECISION NOT NULL,
+                stop_loss DOUBLE PRECISION NOT NULL,
+                market_bias TEXT NOT NULL,
+                close_reason TEXT,
+                snapshot TEXT NOT NULL,
+                current_snapshot TEXT NOT NULL
+            )
+            """
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_ideas_symbol_day "
+            "ON automatic_trade_ideas(symbol, trading_day)"
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_ideas_status "
+            "ON automatic_trade_ideas(symbol, status, expiration)"
+        )
+        self.execute(
+            """
+            CREATE TABLE IF NOT EXISTS automatic_scan_runs (
+                id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                trading_day TEXT NOT NULL,
+                scanned_at TEXT NOT NULL,
+                spot DOUBLE PRECISION NOT NULL,
+                market_bias TEXT NOT NULL,
+                created_count INTEGER NOT NULL,
+                updated_count INTEGER NOT NULL,
+                context TEXT NOT NULL
+            )
+            """
+        )
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_scans_symbol_time "
+            "ON automatic_scan_runs(symbol, scanned_at)"
+        )
+
+
+def automatic_scanner_settings(symbol, spot, expirations):
+    def setting(name, default):
+        return st.session_state.get(name, st.session_state.get(f"saved_{name}", default))
+
+    instrument = adaptive_strategy_settings(spot)
+    closest_expiration = expirations[0]
+    selected_expiration = setting("auto_idea_expiration", closest_expiration)
+    if selected_expiration not in expirations:
+        selected_expiration = closest_expiration
+
+    width = float(setting(f"auto_idea_width_{symbol}", instrument["default_width"]))
+    if width not in instrument["widths"]:
+        width = float(instrument["default_width"])
+
+    return {
+        "enabled": bool(setting("auto_scanner_enabled", True)),
+        "mode": str(setting("auto_expiration_mode", "0 DTE / vencimiento más cercano")),
+        "expiration": selected_expiration,
+        "width": width,
+        "contracts": int(setting("auto_idea_contracts", 1)),
+        "target_delta": float(setting("auto_target_delta", 0.15)),
+        "minimum_credit": float(setting("auto_minimum_credit", 0.35)),
+        "maximum_risk": float(setting("auto_maximum_risk", 1000.0)),
+        "take_profit_percent": float(setting("auto_take_profit", 50.0)),
+        "stop_loss_percent": float(setting("auto_stop_loss", 50.0)),
+        "require_outside_expected": bool(setting("auto_outside_expected", False)),
+        "require_behind_wall": bool(setting("auto_behind_wall", False)),
+        "max_open_per_strategy": int(setting("auto_max_open_per_strategy", 4)),
+    }
+
+
+def automatic_scan_expirations(expirations, settings):
+    nearest = expirations[0]
+    chosen = settings.get("expiration", nearest)
+    if chosen not in expirations:
+        chosen = nearest
+    mode = settings.get("mode", "0 DTE / vencimiento más cercano")
+    if mode == "Vencimiento seleccionado":
+        return [chosen]
+    if mode == "0 DTE + vencimiento seleccionado":
+        return list(dict.fromkeys((nearest, chosen)))
+    return [nearest]
+
+
+def market_is_open(now=None):
+    current = now or market_time()
+    if current.weekday() >= 5:
+        return False
+    opened = current.replace(hour=9, minute=30, second=0, microsecond=0)
+    closed = current.replace(hour=16, minute=0, second=0, microsecond=0)
+    return opened <= current < closed
+
+
+def automatic_market_context(symbol, spot, summary, expected):
+    frame = pd.DataFrame()
+    try:
+        candle_data = load_candles("1min", symbol)
+        if str(candle_data.get("symbol") or "").upper() == str(symbol).upper():
+            frame = pd.DataFrame(candle_data.get("candles") or [])
+    except Exception:
+        pass
+
+    ema9 = None
+    ema21 = None
+    atr = None
+    vwap = None
+    momentum = 0.0
+    if not frame.empty and "close" in frame.columns:
+        for field in ("close", "high", "low", "volume"):
+            if field in frame.columns:
+                frame[field] = pd.to_numeric(frame[field], errors="coerce")
+        closes = frame["close"].dropna()
+        if not closes.empty:
+            ema9 = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
+            ema21 = float(closes.ewm(span=21, adjust=False).mean().iloc[-1])
+            reference = float(closes.iloc[-min(len(closes), 8)])
+            momentum = float(spot) - reference
+        if all(field in frame.columns for field in ("high", "low", "close")):
+            previous_close = frame["close"].shift(1)
+            true_ranges = pd.concat(
+                [
+                    frame["high"] - frame["low"],
+                    (frame["high"] - previous_close).abs(),
+                    (frame["low"] - previous_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            if not true_ranges.dropna().empty:
+                atr = float(true_ranges.tail(14).mean())
+        if all(field in frame.columns for field in ("high", "low", "close", "volume")):
+            volume = frame["volume"].fillna(0)
+            if float(volume.sum()) > 0:
+                typical = (frame["high"] + frame["low"] + frame["close"]) / 3
+                vwap = float((typical * volume).sum() / volume.sum())
+
+    directional_score = 0
+    if ema9 is not None:
+        directional_score += 1 if spot >= ema9 else -1
+    if ema9 is not None and ema21 is not None:
+        directional_score += 1 if ema9 >= ema21 else -1
+    if abs(momentum) >= max(float(atr or 0) * 0.35, float(spot) * 0.00008):
+        directional_score += 1 if momentum > 0 else -1
+    if vwap is not None:
+        directional_score += 1 if spot >= vwap else -1
+
+    gamma_flip = expected.get("gamma_flip")
+    gamma_regime = (
+        "POSITIVO / ESTABLE"
+        if gamma_flip is not None and spot >= gamma_flip
+        else "NEGATIVO / VOLÁTIL"
+        if gamma_flip is not None
+        else "NO IDENTIFICADO"
+    )
+    if directional_score >= 2:
+        bias = "ALCISTA"
+    elif directional_score <= -2:
+        bias = "BAJISTA"
+    else:
+        bias = "NEUTRAL"
+
+    projected = float(spot) + momentum * 0.35
+    magnet = expected.get("gamma_magnet") or summary.get("mvs")
+    if magnet is not None:
+        projected += (float(magnet) - float(spot)) * 0.12
+    if vwap is not None:
+        projected += (float(vwap) - float(spot)) * 0.08
+    daily_move = float(expected.get("daily_move") or 0)
+    if daily_move > 0:
+        projected = min(max(projected, float(spot) - daily_move), float(spot) + daily_move)
+
+    return {
+        "symbol": symbol,
+        "spot": round(float(spot), 4),
+        "put_wall": summary.get("put_wall"),
+        "call_wall": summary.get("call_wall"),
+        "gamma_flip": gamma_flip,
+        "gamma_magnet": expected.get("gamma_magnet"),
+        "gamma_regime": gamma_regime,
+        "net_gamma": (summary.get("gamma_levels") or {}).get("net_gamma"),
+        "mvs": summary.get("mvs"),
+        "atm_iv": expected.get("atm_iv"),
+        "expected_lower": expected.get("expiry_lower"),
+        "expected_upper": expected.get("expiry_upper"),
+        "daily_lower": expected.get("daily_lower"),
+        "daily_upper": expected.get("daily_upper"),
+        "ema9": ema9,
+        "ema21": ema21,
+        "atr14": atr,
+        "vwap": vwap,
+        "momentum": round(momentum, 4),
+        "directional_score": directional_score,
+        "market_bias": bias,
+        "projected_price": round(projected, 4),
+        "captured_at": market_time().isoformat(timespec="seconds"),
+    }
+
+
+def score_automatic_candidate(candidate, context):
+    idea = dict(candidate)
+    strategy = idea["strategy"]
+    score = float(idea.get("score") or 0)
+    reasons = []
+    bias = context.get("market_bias", "NEUTRAL")
+
+    if strategy == "PCS":
+        if bias == "ALCISTA":
+            score += 14
+            reasons.append("Tendencia y momentum favorecen un spread de puts.")
+        elif bias == "BAJISTA":
+            score -= 18
+            reasons.append("La tendencia bajista eleva el riesgo de este PCS.")
+    elif strategy == "CCS":
+        if bias == "BAJISTA":
+            score += 14
+            reasons.append("Tendencia y momentum favorecen un spread de calls.")
+        elif bias == "ALCISTA":
+            score -= 18
+            reasons.append("La tendencia alcista eleva el riesgo de este CCS.")
+    elif strategy == "Iron Condor":
+        if bias == "NEUTRAL":
+            score += 16
+            reasons.append("Mercado lateral: las dos alas aprovechan el rango esperado.")
+        else:
+            score -= 8
+            reasons.append("Existe sesgo direccional; vigila especialmente el lado expuesto.")
+    elif strategy == "Iron Butterfly":
+        if bias == "NEUTRAL":
+            score += 18
+            reasons.append(
+                "Mercado lateral: el Iron Butterfly concentra su beneficio alrededor del strike central."
+            )
+        else:
+            score -= 14
+            reasons.append(
+                "El sesgo direccional puede alejar el precio del centro del Iron Butterfly."
+            )
+        center = float(idea.get("center_strike") or idea.get("short_strike") or 0)
+        magnet = context.get("gamma_magnet") or context.get("mvs")
+        if center > 0 and magnet is not None:
+            distance = abs(center - float(magnet))
+            if distance <= max(float(context.get("atr14") or 0) * 2, 5):
+                score += 9
+                reasons.append("El strike central está próximo al imán gamma o MVS.")
+
+    if idea.get("behind_wall"):
+        score += 6
+        reasons.append("Strike vendido protegido por put wall/call wall.")
+    if idea.get("outside_expected"):
+        score += 7
+        reasons.append("El strike queda fuera del movimiento esperado.")
+    if context.get("gamma_regime") == "POSITIVO / ESTABLE":
+        score += 5
+        reasons.append("Gamma positiva: escenario históricamente más estable, sin garantía.")
+    elif context.get("gamma_regime") == "NEGATIVO / VOLÁTIL":
+        score -= 5
+        reasons.append("Gamma negativa: puede aumentar la velocidad de los movimientos.")
+
+    delta = min(max(abs(float(idea.get("delta") or 0)), 0.01), 0.95)
+    estimated_probability = idea.get("estimated_probability")
+    if estimated_probability is None:
+        estimated_probability = max(min((1 - delta) * 100, 98), 5)
+    estimated_probability = min(max(float(estimated_probability), 5), 98)
+    confidence = min(max((score * 0.58) + (estimated_probability * 0.42), 5), 98)
+    idea["score"] = round(score, 2)
+    idea["confidence"] = round(confidence, 1)
+    idea["estimated_probability"] = round(estimated_probability, 1)
+    idea["reasons"] = reasons
+    return idea
+
+
+def create_iron_condor_candidates(put_ideas, call_ideas, maximum_risk):
+    candidates = []
+    for put in put_ideas[:2]:
+        for call in call_ideas[:2]:
+            if put["expiration"] != call["expiration"] or put["contracts"] != call["contracts"]:
+                continue
+            if float(put["short_strike"]) >= float(call["short_strike"]):
+                continue
+
+            contracts = int(put["contracts"])
+            credit = round(float(put["credit"]) + float(call["credit"]), 2)
+            put_width = abs(float(put["short_strike"]) - float(put["long_strike"]))
+            call_width = abs(float(call["long_strike"]) - float(call["short_strike"]))
+            maximum_loss = (max(put_width, call_width) - credit) * 100 * contracts
+            if credit <= 0 or maximum_loss <= 0 or maximum_loss > float(maximum_risk):
+                continue
+
+            candidates.append(
+                {
+                    "strategy": "Iron Condor",
+                    "short_strike": float(put["short_strike"]),
+                    "long_strike": float(put["long_strike"]),
+                    "secondary_short_strike": float(call["short_strike"]),
+                    "secondary_long_strike": float(call["long_strike"]),
+                    "expiration": put["expiration"],
+                    "contracts": contracts,
+                    "credit": credit,
+                    "bid_credit": round(float(put["bid_credit"]) + float(call["bid_credit"]), 2),
+                    "max_profit": credit * 100 * contracts,
+                    "max_loss": maximum_loss,
+                    "delta": min(abs(float(put["delta"])) + abs(float(call["delta"])), 0.99),
+                    "gamma": float(put["gamma"]) + float(call["gamma"]),
+                    "distance": min(float(put["distance"]), float(call["distance"])),
+                    "wall": None,
+                    "behind_wall": bool(put.get("behind_wall") and call.get("behind_wall")),
+                    "outside_expected": bool(
+                        put.get("outside_expected") and call.get("outside_expected")
+                    ),
+                    "expected_boundary": None,
+                    "score": (float(put["score"]) + float(call["score"])) / 2,
+                    "dte": int(put.get("dte") or 0),
+                    "put_credit": float(put["credit"]),
+                    "call_credit": float(call["credit"]),
+                }
+            )
+
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates[:2]
+
+
+def create_iron_butterfly_candidates(
+    options, spot, expiration, width, contracts, minimum_credit, maximum_risk, summary, expected
+):
+    index = defender.build_option_index(options)
+    paired_strikes = sorted(
+        {
+            float(strike)
+            for option_type, strike in index
+            if option_type == "put" and ("call", strike) in index
+        },
+        key=lambda strike: abs(strike - float(spot)),
+    )
+    candidates = []
+    width = float(width)
+    contracts = int(contracts)
+    expected_lower = expected.get("expiry_lower")
+    expected_upper = expected.get("expiry_upper")
+    expected_scale = expected.get("expiry_move")
+    if not expected_scale and expected_lower is not None and expected_upper is not None:
+        expected_scale = abs(float(expected_upper) - float(expected_lower)) / 2
+
+    for center in paired_strikes[:5]:
+        if abs(center - float(spot)) > max(width * 1.5, 5):
+            continue
+        short_put = defender.get_option(index, "put", center)
+        long_put = defender.get_option(index, "put", center - width)
+        short_call = defender.get_option(index, "call", center)
+        long_call = defender.get_option(index, "call", center + width)
+        if any(option is None for option in (short_put, long_put, short_call, long_call)):
+            continue
+
+        put_credit = float(defender.option_midpoint(short_put)) - float(
+            defender.option_midpoint(long_put)
+        )
+        call_credit = float(defender.option_midpoint(short_call)) - float(
+            defender.option_midpoint(long_call)
+        )
+        total_credit = round(put_credit + call_credit, 2)
+        risk = round((width - total_credit) * defender.CONTRACT_MULTIPLIER * contracts, 2)
+        if (
+            put_credit <= 0
+            or call_credit <= 0
+            or total_credit < float(minimum_credit)
+            or total_credit >= width
+            or risk <= 0
+            or risk > float(maximum_risk)
+        ):
+            continue
+
+        put_bid = defender.number(short_put.get("bid"))
+        put_ask = defender.number(long_put.get("ask"))
+        call_bid = defender.number(short_call.get("bid"))
+        call_ask = defender.number(long_call.get("ask"))
+        conservative_put = max(put_bid - put_ask, 0) if put_bid and put_ask else put_credit
+        conservative_call = (
+            max(call_bid - call_ask, 0) if call_bid and call_ask else call_credit
+        )
+        lower_breakeven = center - total_credit
+        upper_breakeven = center + total_credit
+        if expected_scale and float(expected_scale) > 0:
+            scale = float(expected_scale)
+            upper_probability = 0.5 * (
+                1 + math.erf((upper_breakeven - float(spot)) / (scale * math.sqrt(2)))
+            )
+            lower_probability = 0.5 * (
+                1 + math.erf((lower_breakeven - float(spot)) / (scale * math.sqrt(2)))
+            )
+            probability = max(min((upper_probability - lower_probability) * 100, 98), 5)
+        else:
+            probability = 45.0
+
+        put_greeks = short_put.get("greeks") or {}
+        call_greeks = short_call.get("greeks") or {}
+        net_delta = abs(
+            defender.number(put_greeks.get("delta"))
+            + defender.number(call_greeks.get("delta"))
+        )
+        gamma = defender.number(put_greeks.get("gamma")) + defender.number(
+            call_greeks.get("gamma")
+        )
+        put_wall = summary.get("put_wall")
+        call_wall = summary.get("call_wall")
+        protected = bool(
+            put_wall is not None
+            and call_wall is not None
+            and center - width <= float(put_wall)
+            and center + width >= float(call_wall)
+        )
+        magnet = expected.get("gamma_magnet") or summary.get("mvs")
+        center_distance = abs(center - float(spot))
+        score = 86 - min(center_distance / max(width, 0.01) * 12, 18)
+        if magnet is not None:
+            score += max(10 - abs(center - float(magnet)) / max(width, 0.01) * 6, 0)
+        score += min(total_credit / width * 15, 12)
+
+        candidates.append(
+            {
+                "strategy": "Iron Butterfly",
+                "short_strike": center,
+                "long_strike": center - width,
+                "secondary_short_strike": center,
+                "secondary_long_strike": center + width,
+                "center_strike": center,
+                "expiration": str(expiration),
+                "contracts": contracts,
+                "credit": total_credit,
+                "bid_credit": round(conservative_put + conservative_call, 2),
+                "max_profit": total_credit * defender.CONTRACT_MULTIPLIER * contracts,
+                "max_loss": risk,
+                "delta": net_delta,
+                "gamma": gamma,
+                "distance": center_distance,
+                "wall": None,
+                "behind_wall": protected,
+                "outside_expected": False,
+                "expected_boundary": None,
+                "score": score,
+                "dte": max(
+                    (date.fromisoformat(str(expiration)) - market_time().date()).days,
+                    0,
+                ),
+                "put_credit": round(put_credit, 4),
+                "call_credit": round(call_credit, 4),
+                "lower_breakeven": round(lower_breakeven, 4),
+                "upper_breakeven": round(upper_breakeven, 4),
+                "estimated_probability": round(probability, 1),
+            }
+        )
+
+    candidates.sort(key=lambda idea: idea["score"], reverse=True)
+    return candidates[:2]
+
+
+def automatic_signal_signature(symbol, trading_day, idea):
+    strikes = (
+        float(idea["short_strike"]),
+        float(idea["long_strike"]),
+        float(idea.get("secondary_short_strike") or 0),
+        float(idea.get("secondary_long_strike") or 0),
+    )
+    return "|".join(
+        [
+            str(symbol).upper(),
+            str(trading_day),
+            str(idea["strategy"]),
+            str(idea["expiration"]),
+            *(f"{strike:.4f}" for strike in strikes),
+        ]
+    )
+
+
+def save_automatic_signal(database, symbol, idea, context, settings, current_time=None):
+    now = current_time or market_time()
+    timestamp = now.isoformat(timespec="seconds")
+    trading_day = now.date().isoformat()
+    max_profit = round(float(idea["max_profit"]), 2)
+    max_risk = round(float(idea["max_loss"]), 2)
+    snapshot = {
+        **context,
+        "dte": int(idea.get("dte") or 0),
+        "bid_credit": float(idea.get("bid_credit") or 0),
+        "behind_wall": bool(idea.get("behind_wall")),
+        "outside_expected": bool(idea.get("outside_expected")),
+        "estimated_probability": float(idea.get("estimated_probability") or 0),
+        "reasons": list(idea.get("reasons") or []),
+        "put_credit": float(idea.get("put_credit") or 0),
+        "call_credit": float(idea.get("call_credit") or 0),
+        "center_strike": idea.get("center_strike"),
+        "lower_breakeven": idea.get("lower_breakeven"),
+        "upper_breakeven": idea.get("upper_breakeven"),
+    }
+    row = {
+        "id": uuid.uuid4().hex,
+        "signature": automatic_signal_signature(symbol, trading_day, idea),
+        "symbol": str(symbol).upper(),
+        "strategy": str(idea["strategy"]),
+        "trading_day": trading_day,
+        "expiration": str(idea["expiration"]),
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "closed_at": None,
+        "status": "OPEN",
+        "contracts": int(idea["contracts"]),
+        "short_strike": float(idea["short_strike"]),
+        "long_strike": float(idea["long_strike"]),
+        "secondary_short_strike": (
+            float(idea["secondary_short_strike"])
+            if idea.get("secondary_short_strike") is not None
+            else None
+        ),
+        "secondary_long_strike": (
+            float(idea["secondary_long_strike"])
+            if idea.get("secondary_long_strike") is not None
+            else None
+        ),
+        "entry_credit": round(float(idea["credit"]), 4),
+        "current_debit": round(float(idea["credit"]), 4),
+        "max_profit": max_profit,
+        "max_risk": max_risk,
+        "entry_spot": float(context["spot"]),
+        "current_spot": float(context["spot"]),
+        "current_pnl": 0.0,
+        "realized_pnl": None,
+        "score": float(idea["score"]),
+        "confidence": float(idea.get("confidence") or 0),
+        "delta": float(idea.get("delta") or 0),
+        "gamma": float(idea.get("gamma") or 0),
+        "target_profit": round(max_profit * float(settings["take_profit_percent"]) / 100, 2),
+        "stop_loss": round(max_risk * float(settings["stop_loss_percent"]) / 100, 2),
+        "market_bias": str(context["market_bias"]),
+        "close_reason": None,
+        "snapshot": json.dumps(snapshot, ensure_ascii=False, default=str),
+        "current_snapshot": json.dumps(snapshot, ensure_ascii=False, default=str),
+    }
+    columns = ", ".join(row)
+    placeholders = ", ".join("?" for _ in row)
+    cursor = database.execute(
+        f"INSERT INTO automatic_trade_ideas ({columns}) VALUES ({placeholders}) "
+        "ON CONFLICT(signature) DO NOTHING",
+        tuple(row.values()),
+    )
+    return cursor.rowcount == 1
+
+
+def automatic_signal_snapshot(signal, field="snapshot"):
+    try:
+        value = json.loads(str(signal.get(field) or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def list_automatic_signals(symbol, trading_day=None, strategy=None, status=None, limit=500):
+    statement = "SELECT * FROM automatic_trade_ideas WHERE symbol = ?"
+    parameters = [str(symbol).upper()]
+    if trading_day:
+        statement += " AND trading_day = ?"
+        parameters.append(str(trading_day))
+    if strategy and strategy != "Todas":
+        statement += " AND strategy = ?"
+        parameters.append(str(strategy))
+    if status:
+        statement += " AND status = ?"
+        parameters.append(str(status))
+    statement += " ORDER BY created_at DESC LIMIT ?"
+    parameters.append(int(limit))
+    with AutomaticIdeasDatabase() as database:
+        return database.query(statement, parameters)
+
+
+def latest_automatic_scan(symbol):
+    with AutomaticIdeasDatabase() as database:
+        rows = database.query(
+            "SELECT * FROM automatic_scan_runs WHERE symbol = ? "
+            "ORDER BY scanned_at DESC LIMIT 1",
+            (str(symbol).upper(),),
+        )
+    return rows[0] if rows else None
+
+
+def historical_expiration_spot(symbol, expiration, fallback):
+    try:
+        response = get_client().get(
+            "/markets/history",
+            {"symbol": symbol, "interval": "daily", "start": expiration, "end": expiration},
+        )
+        days = (response.get("history") or {}).get("day") or []
+        if isinstance(days, dict):
+            days = [days]
+        for item in days:
+            if str(item.get("date")) == str(expiration):
+                value = defender.number(item.get("close"))
+                if value > 0:
+                    return float(value)
+    except Exception:
+        pass
+    return float(fallback)
+
+
+def automatic_signal_intrinsic_value(signal, spot):
+    put_value = 0.0
+    call_value = 0.0
+    strategy = str(signal["strategy"])
+    if strategy in ("PCS", "Iron Condor", "Iron Butterfly"):
+        put_value = max(float(signal["short_strike"]) - spot, 0) - max(
+            float(signal["long_strike"]) - spot, 0
+        )
+    if strategy == "CCS":
+        call_value = max(spot - float(signal["short_strike"]), 0) - max(
+            spot - float(signal["long_strike"]), 0
+        )
+    if strategy in ("Iron Condor", "Iron Butterfly"):
+        call_value = max(spot - float(signal["secondary_short_strike"]), 0) - max(
+            spot - float(signal["secondary_long_strike"]), 0
+        )
+    return max(put_value + call_value, 0.0)
+
+
+def automatic_signal_market_value(signal, index):
+    legs = []
+    strategy = str(signal["strategy"])
+    if strategy in ("PCS", "Iron Condor", "Iron Butterfly"):
+        legs.append(("put", signal["short_strike"], signal["long_strike"]))
+    if strategy == "CCS":
+        legs.append(("call", signal["short_strike"], signal["long_strike"]))
+    if strategy in ("Iron Condor", "Iron Butterfly"):
+        legs.append(
+            ("call", signal["secondary_short_strike"], signal["secondary_long_strike"])
+        )
+
+    total = 0.0
+    for option_type, short_strike, long_strike in legs:
+        short_option = defender.get_option(index, option_type, float(short_strike))
+        long_option = defender.get_option(index, option_type, float(long_strike))
+        if short_option is None or long_option is None:
+            raise RuntimeError("No se encontraron todas las patas de la señal.")
+        total += max(
+            float(defender.option_midpoint(short_option))
+            - float(defender.option_midpoint(long_option)),
+            0.0,
+        )
+    return max(total, 0.0)
+
+
+def update_automatic_open_signals(symbol, current_spot=None, current_time=None):
+    now = current_time or market_time()
+    spot = float(current_spot if current_spot is not None else load_spx(symbol))
+    indexes = {}
+    updated_count = 0
+    with AutomaticIdeasDatabase() as database:
+        signals = database.query(
+            "SELECT * FROM automatic_trade_ideas WHERE symbol = ? AND status = 'OPEN' "
+            "ORDER BY created_at ASC",
+            (str(symbol).upper(),),
+        )
+        for signal in signals:
+            expiration = date.fromisoformat(str(signal["expiration"]))
+            expired = expiration < now.date() or (
+                expiration == now.date() and now.hour >= 16
+            )
+            reference_spot = (
+                historical_expiration_spot(symbol, signal["expiration"], spot)
+                if expired and expiration < now.date()
+                else spot
+            )
+            try:
+                if expired:
+                    debit = automatic_signal_intrinsic_value(signal, reference_spot)
+                else:
+                    if signal["expiration"] not in indexes:
+                        options = load_chain(signal["expiration"], symbol)
+                        indexes[signal["expiration"]] = defender.build_option_index(options)
+                    debit = automatic_signal_market_value(
+                        signal, indexes[signal["expiration"]]
+                    )
+            except Exception:
+                continue
+
+            multiplier = int(signal["contracts"]) * defender.CONTRACT_MULTIPLIER
+            pnl = round((float(signal["entry_credit"]) - debit) * multiplier, 2)
+            status = "OPEN"
+            close_reason = None
+            if expired:
+                status = "CLOSED"
+                close_reason = "VENCIMIENTO"
+            elif pnl >= float(signal["target_profit"]):
+                status = "CLOSED"
+                close_reason = "OBJETIVO DE GANANCIA"
+            elif pnl <= -float(signal["stop_loss"]):
+                status = "CLOSED"
+                close_reason = "LÍMITE DE PÉRDIDA"
+
+            latest_snapshot = {
+                **automatic_signal_snapshot(signal),
+                "spot": round(reference_spot, 4),
+                "spread_debit": round(debit, 4),
+                "pnl": pnl,
+                "updated_at": now.isoformat(timespec="seconds"),
+            }
+            closed_at = now.isoformat(timespec="seconds") if status == "CLOSED" else None
+            realized = pnl if status == "CLOSED" else None
+            database.execute(
+                "UPDATE automatic_trade_ideas SET updated_at = ?, current_debit = ?, "
+                "current_spot = ?, current_pnl = ?, status = ?, closed_at = ?, "
+                "realized_pnl = ?, close_reason = ?, current_snapshot = ? WHERE id = ?",
+                (
+                    now.isoformat(timespec="seconds"),
+                    round(debit, 4),
+                    round(reference_spot, 4),
+                    pnl,
+                    status,
+                    closed_at,
+                    realized,
+                    close_reason,
+                    json.dumps(latest_snapshot, ensure_ascii=False, default=str),
+                    signal["id"],
+                ),
+            )
+            updated_count += 1
+
+    return updated_count
+
+
+def perform_automatic_scan(symbol, expirations, force=False):
+    now = market_time()
+    spot = float(load_spx(symbol))
+    settings = automatic_scanner_settings(symbol, spot, expirations)
+    updated_count = update_automatic_open_signals(symbol, spot, now)
+    if not settings["enabled"]:
+        return {
+            "state": "PAUSADO",
+            "created": 0,
+            "updated": updated_count,
+            "scanned_at": now.isoformat(timespec="seconds"),
+        }
+    if not market_is_open(now):
+        return {
+            "state": "MERCADO CERRADO",
+            "created": 0,
+            "updated": updated_count,
+            "scanned_at": now.isoformat(timespec="seconds"),
+        }
+
+    last_scan = latest_automatic_scan(symbol)
+    if last_scan and not force:
+        try:
+            previous = datetime.fromisoformat(str(last_scan["scanned_at"]))
+            if previous.tzinfo is None and now.tzinfo is not None:
+                previous = previous.replace(tzinfo=now.tzinfo)
+            if 0 <= (now - previous).total_seconds() < AUTO_IDEA_SCAN_SECONDS * 0.8:
+                return {
+                    "state": "ACTIVO",
+                    "created": 0,
+                    "updated": updated_count,
+                    "scanned_at": str(last_scan["scanned_at"]),
+                }
+        except (TypeError, ValueError):
+            pass
+
+    created_count = 0
+    contexts = []
+    for expiration in automatic_scan_expirations(expirations, settings):
+        try:
+            generated, summary, expected, fresh_spot = generate_ideas(
+                expiration,
+                settings["width"],
+                settings["minimum_credit"],
+                settings["maximum_risk"],
+                settings["target_delta"],
+                settings["contracts"],
+                settings["require_outside_expected"],
+                settings["require_behind_wall"],
+            )
+            context = automatic_market_context(symbol, fresh_spot, summary, expected)
+            contexts.append(context)
+            expiration_options = load_chain(expiration, symbol)
+            candidates = {
+                "PCS": generated.get("PCS", []),
+                "CCS": generated.get("CCS", []),
+                "Iron Condor": create_iron_condor_candidates(
+                    generated.get("PCS", []),
+                    generated.get("CCS", []),
+                    settings["maximum_risk"],
+                ),
+                "Iron Butterfly": create_iron_butterfly_candidates(
+                    expiration_options,
+                    fresh_spot,
+                    expiration,
+                    settings["width"],
+                    settings["contracts"],
+                    settings["minimum_credit"],
+                    settings["maximum_risk"],
+                    summary,
+                    expected,
+                ),
+            }
+            with AutomaticIdeasDatabase() as database:
+                counts = {
+                    row["strategy"]: int(row["total"])
+                    for row in database.query(
+                        "SELECT strategy, COUNT(*) AS total FROM automatic_trade_ideas "
+                        "WHERE symbol = ? AND status = 'OPEN' GROUP BY strategy",
+                        (str(symbol).upper(),),
+                    )
+                }
+                for strategy, strategy_candidates in candidates.items():
+                    scored = sorted(
+                        (
+                            score_automatic_candidate(candidate, context)
+                            for candidate in strategy_candidates
+                        ),
+                        key=lambda candidate: candidate["score"],
+                        reverse=True,
+                    )
+                    for idea in scored[:2]:
+                        if counts.get(strategy, 0) >= settings["max_open_per_strategy"]:
+                            break
+                        if idea["confidence"] < 45:
+                            continue
+                        if save_automatic_signal(database, symbol, idea, context, settings, now):
+                            created_count += 1
+                            counts[strategy] = counts.get(strategy, 0) + 1
+        except Exception as error:
+            st.session_state["auto_scanner_last_error"] = str(error)
+
+    reference_context = contexts[0] if contexts else {
+        "spot": spot,
+        "market_bias": "SIN DATOS",
+        "captured_at": now.isoformat(timespec="seconds"),
+    }
+    with AutomaticIdeasDatabase() as database:
+        database.execute(
+            "INSERT INTO automatic_scan_runs "
+            "(id, symbol, trading_day, scanned_at, spot, market_bias, "
+            "created_count, updated_count, context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                uuid.uuid4().hex,
+                str(symbol).upper(),
+                now.date().isoformat(),
+                now.isoformat(timespec="seconds"),
+                float(reference_context.get("spot") or spot),
+                str(reference_context.get("market_bias") or "SIN DATOS"),
+                int(created_count),
+                int(updated_count),
+                json.dumps(reference_context, ensure_ascii=False, default=str),
+            ),
+        )
+
+    return {
+        "state": "ACTIVO",
+        "created": created_count,
+        "updated": updated_count,
+        "scanned_at": now.isoformat(timespec="seconds"),
+        "context": reference_context,
+    }
+
+
+def automatic_strategy_statistics(symbol, trading_day=None):
+    statement = (
+        "SELECT trading_day, strategy, COUNT(*) AS total, "
+        "SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS opened, "
+        "SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed, "
+        "SUM(CASE WHEN status = 'CLOSED' AND realized_pnl > 0 THEN 1 ELSE 0 END) AS winners, "
+        "SUM(CASE WHEN status = 'CLOSED' AND realized_pnl < 0 THEN 1 ELSE 0 END) AS losers, "
+        "COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN realized_pnl ELSE 0 END), 0) "
+        "AS realized_pnl, "
+        "COALESCE(SUM(CASE WHEN status = 'OPEN' THEN current_pnl ELSE 0 END), 0) "
+        "AS open_pnl, "
+        "COALESCE(AVG(score), 0) AS average_score, "
+        "COALESCE(AVG(confidence), 0) AS average_confidence "
+        "FROM automatic_trade_ideas WHERE symbol = ?"
+    )
+    parameters = [str(symbol).upper()]
+    if trading_day:
+        statement += " AND trading_day = ?"
+        parameters.append(str(trading_day))
+    statement += " GROUP BY trading_day, strategy ORDER BY trading_day DESC, realized_pnl DESC"
+    with AutomaticIdeasDatabase() as database:
+        return database.query(statement, parameters)
+
+
+def automatic_signal_title(signal):
+    if signal["strategy"] in ("Iron Condor", "Iron Butterfly"):
+        return (
+            f"{signal['short_strike']:,.2f}/{signal['long_strike']:,.2f} · "
+            f"{signal['secondary_short_strike']:,.2f}/{signal['secondary_long_strike']:,.2f}"
+        )
+    return f"{signal['short_strike']:,.2f}/{signal['long_strike']:,.2f}"
+
+
+def save_automatic_signal_to_operations(signal):
+    snapshot = automatic_signal_snapshot(signal)
+    if signal["strategy"] in ("Iron Condor", "Iron Butterfly"):
+        put_credit = float(snapshot.get("put_credit") or float(signal["entry_credit"]) / 2)
+        call_credit = float(snapshot.get("call_credit") or float(signal["entry_credit"]) / 2)
+        positions = (
+            validate_position(
+                "PCS",
+                float(signal["short_strike"]),
+                float(signal["long_strike"]),
+                put_credit,
+                int(signal["contracts"]),
+            ),
+            validate_position(
+                "CCS",
+                float(signal["secondary_short_strike"]),
+                float(signal["secondary_long_strike"]),
+                call_credit,
+                int(signal["contracts"]),
+            ),
+        )
+    else:
+        positions = (
+            validate_position(
+                str(signal["strategy"]),
+                float(signal["short_strike"]),
+                float(signal["long_strike"]),
+                float(signal["entry_credit"]),
+                int(signal["contracts"]),
+            ),
+        )
+
+    for position in positions:
+        save_trade(
+            position,
+            str(signal["expiration"]),
+            source="idea_automatica",
+            symbol=str(signal["symbol"]),
+            market_context={"spot": float(signal["current_spot"])},
+        )
+    return len(positions)
+
+
+def run_global_automatic_scanner(symbol, expirations):
+    def scanner_fragment():
+        try:
+            result = perform_automatic_scan(symbol, expirations)
+            st.session_state["auto_scanner_result"] = result
+            status = result.get("state", "ACTIVO")
+            timestamp = str(result.get("scanned_at") or "")
+            try:
+                timestamp = datetime.fromisoformat(timestamp).strftime("%I:%M:%S %p")
+            except (TypeError, ValueError):
+                pass
+            with st.sidebar:
+                st.caption(f"🤖 Escáner de ideas: {status} · {timestamp}")
+        except Exception as error:
+            st.session_state["auto_scanner_last_error"] = str(error)
+            with st.sidebar:
+                st.caption(f"⚠️ Escáner automático: {error}")
+
+    use_fragment(scanner_fragment, AUTO_IDEA_SCAN_SECONDS)
+
+
+def schedule_live_page_refresh(page_name, seconds):
+    session_key = f"live_page_refreshed_{page_name}"
+
+    def page_refresh_fragment():
+        now = time.monotonic()
+        last_refresh = st.session_state.get(session_key)
+        if last_refresh is None:
+            st.session_state[session_key] = now
+            st.caption(f"Actualización automática del analizador cada {seconds} segundos.")
+            return
+        if now - float(last_refresh) >= max(float(seconds) - 1, 1):
+            st.session_state[session_key] = now
+            st.rerun()
+        st.caption(f"Actualización automática del analizador cada {seconds} segundos.")
+
+    use_fragment(page_refresh_fragment, seconds)
+
+
 def normal_cdf(value):
     return 0.5 * (1 + math.erf(value / math.sqrt(2)))
 
@@ -1821,7 +2896,23 @@ def build_strategy_template(strategy, index, spx, distance, width, contracts):
     return pd.DataFrame(rows)
 
 
-def normalize_simulator_legs(edited, index, default_iv):
+def synchronize_simulator_market_premiums(frame, index):
+    refreshed = frame.copy()
+    for row_index, row in refreshed.iterrows():
+        option_type = str(row.get("Tipo") or "").strip().lower()
+        strike = defender.number(row.get("Strike"))
+        if option_type not in {"call", "put"} or strike <= 0:
+            continue
+        option = defender.get_option(index, option_type, strike)
+        if option is None:
+            continue
+        midpoint = float(defender.option_midpoint(option) or 0)
+        if midpoint > 0:
+            refreshed.at[row_index, "Prima"] = round(midpoint, 2)
+    return refreshed
+
+
+def normalize_simulator_legs(edited, index, default_iv, live_quotes=False):
     legs = []
     if edited.empty:
         raise RuntimeError("Agrega por lo menos una pata de opciones.")
@@ -1840,6 +2931,9 @@ def normalize_simulator_legs(edited, index, default_iv):
         option = defender.get_option(index, kind, strike)
         if option is None:
             raise RuntimeError(f"No se encontró {kind.upper()} {strike:.0f} en la cadena de Tradier.")
+        market_midpoint = float(defender.option_midpoint(option) or 0)
+        if live_quotes and market_midpoint > 0:
+            premium = round(market_midpoint, 2)
         greeks = option.get("greeks") or {}
         legs.append(
             {
@@ -1849,7 +2943,7 @@ def normalize_simulator_legs(edited, index, default_iv):
                 "premium": premium,
                 "contracts": contracts,
                 "sign": 1 if action == "COMPRAR" else -1,
-                "mid": defender.option_midpoint(option),
+                "mid": market_midpoint,
                 "iv": option_implied_volatility(option) or default_iv or 0.20,
                 "delta": defender.number(greeks.get("delta")),
                 "gamma": defender.number(greeks.get("gamma")),
@@ -2085,7 +3179,7 @@ def build_trade_snapshot(trade, market_context=None):
 
     return {
         "symbol": symbol,
-        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "captured_at": market_time().replace(tzinfo=None).isoformat(timespec="seconds"),
         "spot": round(float(spot), 4),
         "expiration": str(trade["expiration"]),
         "days": days,
@@ -2318,9 +3412,17 @@ export default function(component) {
   const available = [...new Set(chain.map((item) => item.strike))].sort((a, b) => a - b);
   const optionFor = (type, strike) => chain.find((item) => item.type === type && Math.abs(item.strike - strike) < 0.0001);
   const previous = data.selection && data.selection.expiration === data.expiration ? data.selection : {};
+  const liveQuotes = data.live_quotes !== false;
   const sourceLegs = Array.isArray(previous.legs) && previous.legs.length ? previous.legs : data.legs;
   const state = {
-    legs: sourceLegs.map((leg) => ({ ...leg, strike: Number(leg.strike), premium: Number(leg.premium), contracts: Number(leg.contracts || 1) })),
+    legs: sourceLegs.map((leg) => {
+      const strike = Number(leg.strike);
+      const quote = optionFor(String(leg.type || "").toLowerCase(), strike);
+      const premium = liveQuotes && quote && Number(quote.mid || 0) > 0
+        ? Number(quote.mid)
+        : Number(leg.premium || 0);
+      return { ...leg, strike, premium, contracts: Number(leg.contracts || 1) };
+    }),
     elapsed: Math.min(Number(previous.elapsed || 0), Math.max(Number(data.days || 0), 0)),
     ivShift: Number(previous.iv_shift || 0),
     target: Number(previous.target || spot),
@@ -2793,7 +3895,7 @@ def component_state_value(component_key, field, default=None):
         return getattr(state, field, default)
 
 
-def apply_visual_selection(frame, index, selection, expiration):
+def apply_visual_selection(frame, index, selection, expiration, live_quotes=False):
     if not isinstance(selection, dict) or selection.get("expiration") != expiration:
         return frame
     selected_legs = selection.get("legs")
@@ -2814,14 +3916,22 @@ def apply_visual_selection(frame, index, selection, expiration):
                 "Acción": action,
                 "Tipo": option_type.upper(),
                 "Strike": float(strike),
-                "Prima": round(defender.number(leg.get("premium"), defender.option_midpoint(option)), 2),
+                "Prima": round(
+                    float(defender.option_midpoint(option))
+                    if live_quotes and float(defender.option_midpoint(option) or 0) > 0
+                    else defender.number(leg.get("premium"), defender.option_midpoint(option)),
+                    2,
+                ),
                 "Contratos": max(defender.integer(leg.get("contracts")), 1),
             }
         )
     return pd.DataFrame(rows)
 
 
-def create_visual_payload(symbol, spot, strategy, expiration, expirations, options, legs, expected, graph_range, selection):
+def create_visual_payload(
+    symbol, spot, strategy, expiration, expirations, options, legs, expected,
+    graph_range, selection, live_quotes=True
+):
     limited = []
     radius = max(float(graph_range) * 1.8, float(spot) * 0.22, 10)
     selected_strikes = {float(leg["strike"]) for leg in legs}
@@ -2867,6 +3977,7 @@ def create_visual_payload(symbol, spot, strategy, expiration, expirations, optio
             for leg in legs
         ],
         "selection": selection if isinstance(selection, dict) else {},
+        "live_quotes": bool(live_quotes),
         "atm_iv": expected.get("atm_iv") or 0.20,
         "expected_lower": expected.get("expiry_lower"),
         "expected_upper": expected.get("expiry_upper"),
@@ -3251,7 +4362,13 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Selecciona una sección",
-        ["📈 Mercado", "💡 Ideas de trades", "📊 Simulador de opciones", "📋 Mis operaciones"],
+        [
+            "📈 Mercado",
+            "🛡️ Analizar operación",
+            "💡 Ideas de trades",
+            "📊 Simulador de opciones",
+            "📋 Mis operaciones",
+        ],
         label_visibility="collapsed",
     )
 
@@ -3280,6 +4397,9 @@ with st.sidebar:
         st.caption(f"Operaciones abiertas guardadas: {opened_count}")
     except RuntimeError as error:
         st.error(str(error))
+
+
+run_global_automatic_scanner(selected_symbol(), expirations)
 
 
 if page == "📈 Mercado":
@@ -3474,13 +4594,19 @@ if page == "📈 Mercado":
                 "para CALL y PUT del vencimiento y rango seleccionados."
             )
         st.caption(
-            f"Actualizado: {datetime.now().strftime('%I:%M:%S %p')} · {expected['method']}. "
+            f"Actualizado: {market_time().strftime('%I:%M:%S %p')} · {expected['method']}. "
             "MVS y gamma flip son niveles estimados; no representan una predicción garantizada."
         )
 
     use_fragment(market_panel, LIVE_MARKET_REFRESH_SECONDS)
-    st.divider()
-    st.subheader("Analizar una operación")
+
+
+elif page == "🛡️ Analizar operación":
+    st.title(f"🛡️ Analizador de operaciones · {selected_symbol()}")
+    st.caption(
+        "Ingresa tu operación una sola vez. El precio, el crédito actual, "
+        "el resultado y las defensas se actualizan automáticamente."
+    )
     reference = nearest_strike(current_spx)
     market_settings = adaptive_strategy_settings(current_spx)
     default_short = max(reference - market_settings["default_distance"], market_settings["step"] * 2)
@@ -3502,136 +4628,433 @@ if page == "📈 Mercado":
 
     if analyze:
         try:
-            position = validate_position(strategy, short_strike, long_strike, credit, contracts)
-            spx = load_spx(selected_symbol())
-            options = load_chain(expiration, selected_symbol())
-            index = defender.build_option_index(options)
-            analysis = defender.analyze_position(position, index, spx)
-            levels = defender.calculate_gamma_levels(options, spx)
-            first, second, third, fourth = st.columns(4)
-            first.metric("Resultado actual", money(analysis["pnl"]))
-            second.metric("Riesgo máximo", money(analysis["max_loss"]))
-            third.metric("Pérdida sobre riesgo", f"{analysis['loss_percent']:.1f}%")
-            fourth.metric("Delta", f"{analysis['short_delta']:+.3f}")
-            render_defenses(position, expiration, expirations, spx, analysis, index, levels)
+            st.session_state["live_analyzer_position"] = {
+                "symbol": selected_symbol(),
+                "expiration": expiration,
+                "position": validate_position(
+                    strategy, short_strike, long_strike, credit, contracts
+                ),
+            }
         except Exception as error:
             st.error(f"No se pudo analizar la operación: {error}")
 
+    live_position = st.session_state.get("live_analyzer_position")
+    if live_position and live_position.get("symbol") == selected_symbol():
+        def live_position_panel():
+            try:
+                position = live_position["position"]
+                live_expiration = live_position["expiration"]
+                spx = load_spx(selected_symbol())
+                options = load_chain(live_expiration, selected_symbol())
+                index = defender.build_option_index(options)
+                analysis = defender.analyze_position(position, index, spx)
+                levels = defender.calculate_gamma_levels(options, spx)
+                first, second, third, fourth, fifth, sixth = st.columns(6)
+                first.metric(f"{selected_symbol()} en vivo", f"{spx:,.2f}")
+                second.metric("Resultado actual", money(analysis["pnl"]))
+                third.metric(
+                    "Crédito inicial",
+                    money(float(position["credit"]) * int(position["contracts"]) * 100),
+                )
+                fourth.metric(
+                    "Crédito actual de mercado",
+                    money(
+                        float(analysis["current_spread_value"])
+                        * int(position["contracts"]) * 100
+                    ),
+                )
+                fifth.metric("Riesgo máximo", money(analysis["max_loss"]))
+                sixth.metric("Delta", f"{analysis['short_delta']:+.3f}")
+                if float(analysis["pnl"]) < 0:
+                    st.warning(
+                        f"Pérdida actual: {float(analysis['loss_percent']):.1f}% "
+                        "del riesgo máximo."
+                    )
+                render_defenses(
+                    position, live_expiration, expirations, spx, analysis, index, levels
+                )
+                st.caption(
+                    f"Análisis en vivo: {market_time().strftime('%I:%M:%S %p')} · "
+                    f"actualización automática cada {AUTO_ANALYZER_REFRESH_SECONDS} segundos."
+                )
+            except Exception as error:
+                st.warning(f"No se pudo actualizar la operación analizada: {error}")
+
+        use_fragment(live_position_panel, AUTO_ANALYZER_REFRESH_SECONDS)
+
 
 elif page == "💡 Ideas de trades":
-    st.title(f"💡 Ideas automáticas de {selected_symbol()}")
-    st.caption("Las ideas se recalculan cada 10 minutos solamente mientras esta sección está abierta.")
-    closest_30 = min(range(len(expirations)), key=lambda index: abs((defender.calculate_days_remaining(expirations[index]) or 0) - 30))
+    st.title(f"💡 Centro automático de ideas · {selected_symbol()}")
+    st.caption(
+        "El motor genera y registra ideas sin presionar botones, sigue su resultado y "
+        "compara el desempeño de cada estrategia día por día."
+    )
 
-    with st.expander("Configuración de las ideas", expanded=True):
+    with st.expander("⚙️ Configuración del escáner y gestión del riesgo", expanded=False):
+        st.toggle("Motor automático activado", value=True, key="auto_scanner_enabled")
         first, second, third = st.columns(3)
-        idea_expiration = first.selectbox("Vencimiento", expirations, index=closest_30, format_func=expiration_name, key="idea_exp")
-        idea_settings = adaptive_strategy_settings(current_spx)
-        idea_width = second.selectbox(
+        first.selectbox(
+            "Vencimientos analizados",
+            [
+                "0 DTE / vencimiento más cercano",
+                "Vencimiento seleccionado",
+                "0 DTE + vencimiento seleccionado",
+            ],
+            key="auto_expiration_mode",
+        )
+        second.selectbox(
+            "Vencimiento seleccionado",
+            expirations,
+            format_func=expiration_name,
+            key="auto_idea_expiration",
+        )
+        auto_settings = adaptive_strategy_settings(current_spx)
+        third.selectbox(
             "Ancho del spread",
-            idea_settings["widths"],
-            index=idea_settings["widths"].index(idea_settings["default_width"]),
-            key=f"idea_width_{selected_symbol()}",
-        )
-        idea_contracts = third.number_input("Contratos por idea", min_value=1, value=1, key="idea_contracts")
-        fourth, fifth, sixth = st.columns(3)
-        target_delta = fourth.slider("Delta objetivo", 0.05, 0.30, 0.12, 0.01)
-        minimum_credit = fifth.number_input("Crédito mínimo por spread", min_value=0.05, value=0.75, step=0.05)
-        maximum_risk = sixth.number_input("Riesgo máximo total ($)", min_value=100, value=1000, step=100)
-        seventh, eighth = st.columns(2)
-        require_outside_expected = seventh.checkbox(
-            "Exigir strike fuera del rango esperado al vencimiento", value=False
-        )
-        require_behind_wall = eighth.checkbox(
-            "Exigir strike protegido por put wall/call wall", value=False
+            auto_settings["widths"],
+            index=auto_settings["widths"].index(auto_settings["default_width"]),
+            key=f"auto_idea_width_{selected_symbol()}",
         )
 
-    if st.button("🔎 Buscar ideas ahora", use_container_width=True):
-        load_spx.clear()
-        load_chain.clear()
-        st.rerun()
+        fourth, fifth, sixth = st.columns(3)
+        fourth.number_input(
+            "Contratos por idea", min_value=1, value=1, step=1, key="auto_idea_contracts"
+        )
+        fifth.slider(
+            "Delta objetivo", min_value=0.05, max_value=0.30, value=0.15,
+            step=0.01, key="auto_target_delta"
+        )
+        sixth.number_input(
+            "Crédito mínimo por spread", min_value=0.05, value=0.35,
+            step=0.05, key="auto_minimum_credit"
+        )
+
+        seventh, eighth, ninth, tenth = st.columns(4)
+        seventh.number_input(
+            "Riesgo máximo ($)", min_value=100, value=1000,
+            step=100, key="auto_maximum_risk"
+        )
+        eighth.slider(
+            "Objetivo: % del crédito", min_value=10, max_value=100,
+            value=50, step=5, key="auto_take_profit"
+        )
+        ninth.slider(
+            "Stop: % del riesgo", min_value=10, max_value=100,
+            value=50, step=5, key="auto_stop_loss"
+        )
+        tenth.slider(
+            "Máximo abiertas por estrategia", min_value=1, max_value=10,
+            value=4, key="auto_max_open_per_strategy"
+        )
+        left, right = st.columns(2)
+        left.checkbox(
+            "Exigir strikes fuera del movimiento esperado", key="auto_outside_expected"
+        )
+        right.checkbox(
+            "Exigir protección mediante put wall / call wall", key="auto_behind_wall"
+        )
+
+    for configuration_key in (
+        "auto_scanner_enabled",
+        "auto_expiration_mode",
+        "auto_idea_expiration",
+        f"auto_idea_width_{selected_symbol()}",
+        "auto_idea_contracts",
+        "auto_target_delta",
+        "auto_minimum_credit",
+        "auto_maximum_risk",
+        "auto_take_profit",
+        "auto_stop_loss",
+        "auto_max_open_per_strategy",
+        "auto_outside_expected",
+        "auto_behind_wall",
+    ):
+        if configuration_key in st.session_state:
+            st.session_state[f"saved_{configuration_key}"] = st.session_state[configuration_key]
+
+    date_column, strategy_column = st.columns([1, 1])
+    selected_history_date = date_column.date_input(
+        "Día que deseas revisar", value=market_time().date(), key="auto_history_day"
+    )
+    strategy_filter = strategy_column.selectbox(
+        "Mostrar estrategia",
+        ["Todas", "PCS", "CCS", "Iron Condor", "Iron Butterfly"],
+        format_func=lambda strategy: (
+            "IB · Iron Butterfly" if strategy == "Iron Butterfly" else strategy
+        ),
+        key="auto_strategy_filter",
+    )
 
     def ideas_panel():
+        symbol = selected_symbol()
         try:
-            ideas, summary, expected, spx = generate_ideas(
-                idea_expiration,
-                idea_width,
-                minimum_credit,
-                maximum_risk,
-                target_delta,
-                idea_contracts,
-                require_outside_expected,
-                require_behind_wall,
+            spot = float(load_spx(symbol))
+            if market_is_open():
+                update_automatic_open_signals(symbol, spot)
+            signals = list_automatic_signals(
+                symbol, selected_history_date.isoformat(), strategy_filter
             )
+            strategy_rows = automatic_strategy_statistics(
+                symbol, selected_history_date.isoformat()
+            )
+            all_statistics = automatic_strategy_statistics(symbol)
+            latest_scan = latest_automatic_scan(symbol)
         except Exception as error:
-            st.error(f"No se pudieron generar ideas: {error}")
+            st.error(f"No se pudo consultar la base de datos de ideas: {error}")
             return
 
-        first, second, third = st.columns(3)
-        first.metric(f"{selected_symbol()} actual", f"{spx:,.2f}")
-        second.metric("Put wall", f"{summary['put_wall']:,.0f}" if summary["put_wall"] is not None else "N/D")
-        third.metric("Call wall", f"{summary['call_wall']:,.0f}" if summary["call_wall"] is not None else "N/D")
+        context = {}
+        if latest_scan:
+            try:
+                context = json.loads(str(latest_scan.get("context") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                context = {}
 
-        if expected["expiry_lower"] is not None:
-            st.info(
-                f"Rango esperado hasta {idea_expiration}: "
-                f"{expected['expiry_lower']:,.1f} — {expected['expiry_upper']:,.1f}. "
-                "Las ideas fuera de este rango reciben mayor puntuación."
-            )
+        opened = [signal for signal in signals if signal.get("status") == "OPEN"]
+        closed = [signal for signal in signals if signal.get("status") == "CLOSED"]
+        winners = [signal for signal in closed if float(signal.get("realized_pnl") or 0) > 0]
+        realized = sum(float(signal.get("realized_pnl") or 0) for signal in closed)
+        open_pnl = sum(float(signal.get("current_pnl") or 0) for signal in opened)
 
-        put_column, call_column = st.columns(2)
-        for strategy, column in (("PCS", put_column), ("CCS", call_column)):
-            with column:
-                st.subheader("🟢 Ideas PCS" if strategy == "PCS" else "🔴 Ideas CCS")
-                if not ideas[strategy]:
-                    st.info("No hay ideas que cumplan los filtros actuales.")
-                for number, idea in enumerate(ideas[strategy], start=1):
-                    with st.container(border=True):
-                        st.markdown(f"**{selected_symbol()} · {strategy} {idea['short_strike']:.2f}/{idea['long_strike']:.2f}**")
-                        one, two, three = st.columns(3)
-                        one.metric("Crédito mid", money(idea["max_profit"]))
-                        two.metric("Riesgo máx.", money(idea["max_loss"]))
-                        three.metric("Delta", f"{idea['delta']:.3f}")
-                        st.write(f"Vence: **{idea['expiration']}** · {idea['dte']} DTE · Distancia: **{idea['distance']:.0f} puntos**")
-                        st.write(f"Crédito estimado: **{idea['credit']:.2f}** · Bid/ask conservador: **{idea['bid_credit']:.2f}**")
-                        if idea["behind_wall"]:
-                            st.success(f"Strike ubicado detrás del {'put wall' if strategy == 'PCS' else 'call wall'} ({idea['wall']:.0f}).")
-                        else:
-                            st.caption("El strike no está protegido por el wall identificado.")
-                        if idea["outside_expected"]:
-                            st.success("El strike vendido está fuera del movimiento esperado al vencimiento.")
-                        elif idea["expected_boundary"] is not None:
-                            st.warning(
-                                "El strike vendido está dentro del movimiento esperado; "
-                                f"nivel de referencia: {idea['expected_boundary']:,.1f}."
-                            )
-
-                        key = f"save_{selected_symbol()}_{strategy}_{idea['expiration']}_{idea['short_strike']}_{number}"
-                        actual_credit = st.number_input(
-                            "Crédito realmente recibido",
-                            min_value=0.01,
-                            value=float(idea["credit"]),
-                            step=0.05,
-                            format="%.2f",
-                            key=f"credit_{key}",
-                        )
-                        if st.button("💾 Guardar y hacer seguimiento", key=key, use_container_width=True):
-                            try:
-                                position = validate_position(
-                                    strategy, idea["short_strike"], idea["long_strike"], actual_credit, idea["contracts"]
-                                )
-                                save_trade(position, idea["expiration"], source="idea")
-                                st.success("Operación guardada. Puedes verla en Mis operaciones.")
-                                st.rerun()
-                            except Exception as error:
-                                st.error(f"No se pudo guardar la operación: {error}")
-
-        st.caption(
-            f"Último análisis: {datetime.now().strftime('%I:%M:%S %p')} · "
-            "Los créditos mid son orientativos y no garantizan ejecución."
+        first, second, third, fourth, fifth, sixth = st.columns(6)
+        first.metric(f"{symbol} en vivo", f"{spot:,.2f}")
+        second.metric("Ideas registradas", len(signals))
+        third.metric("Señales activas", len(opened))
+        fourth.metric("P&L activo", money(open_pnl))
+        fifth.metric("P&L realizado", money(realized))
+        sixth.metric(
+            "Acierto cerrado",
+            f"{len(winners) / len(closed) * 100:.1f}%" if closed else "Sin cierres",
         )
 
-    use_fragment(ideas_panel, 600)
+        first, second, third, fourth, fifth = st.columns(5)
+        first.metric(
+            "Put wall",
+            f"{float(context['put_wall']):,.0f}" if context.get("put_wall") is not None else "N/D",
+        )
+        second.metric(
+            "Call wall",
+            f"{float(context['call_wall']):,.0f}" if context.get("call_wall") is not None else "N/D",
+        )
+        third.metric(
+            "Gamma flip",
+            f"{float(context['gamma_flip']):,.1f}" if context.get("gamma_flip") is not None else "N/D",
+        )
+        fourth.metric("Lectura del mercado", str(context.get("market_bias") or "Esperando"))
+        fifth.metric(
+            "Proyección indicativa",
+            f"{float(context['projected_price']):,.2f}"
+            if context.get("projected_price") is not None else "N/D",
+        )
+
+        active_tab, ranking_tab, history_tab, context_tab = st.tabs(
+            ["📡 SEÑALES ACTIVAS", "🏆 ESTRATEGIAS", "📅 HISTORIAL DIARIO", "🧠 CONTEXTO"]
+        )
+
+        with active_tab:
+            if not opened:
+                st.info(
+                    "Todavía no hay señales activas para este día y filtro. "
+                    "El motor las generará automáticamente durante el horario de mercado."
+                )
+            for signal in opened:
+                snapshot = automatic_signal_snapshot(signal)
+                with st.container(border=True):
+                    heading, status = st.columns([4, 1])
+                    heading.markdown(
+                        f"### {signal['symbol']} · {signal['strategy']} · "
+                        f"{automatic_signal_title(signal)}"
+                    )
+                    status.metric("Confianza", f"{float(signal['confidence']):.0f}%")
+                    st.progress(min(max(float(signal["confidence"]) / 100, 0), 1))
+                    one, two, three, four, five = st.columns(5)
+                    one.metric("P&L actual", money(signal["current_pnl"]))
+                    two.metric("Crédito inicial", money(signal["max_profit"]))
+                    three.metric("Riesgo máximo", money(signal["max_risk"]))
+                    four.metric("Objetivo", money(signal["target_profit"]))
+                    five.metric("Stop simulado", money(-float(signal["stop_loss"])))
+                    dte = int(snapshot.get("dte") or 0)
+                    st.caption(
+                        f"Vence {signal['expiration']} · {dte} DTE · "
+                        f"Entrada {float(signal['entry_spot']):,.2f} · "
+                        f"Actual {float(signal['current_spot']):,.2f} · "
+                        f"Delta {float(signal['delta']):.3f} · "
+                        f"Registrada {str(signal['created_at'])[11:19]}"
+                    )
+                    if (
+                        signal["strategy"] == "Iron Butterfly"
+                        and snapshot.get("lower_breakeven") is not None
+                        and snapshot.get("upper_breakeven") is not None
+                    ):
+                        st.caption(
+                            f"Centro IB {float(signal['short_strike']):,.2f} · "
+                            f"breakeven inferior {float(snapshot['lower_breakeven']):,.2f} · "
+                            f"breakeven superior {float(snapshot['upper_breakeven']):,.2f}."
+                        )
+                    reasons = snapshot.get("reasons") or []
+                    if reasons:
+                        st.write(" · ".join(str(reason) for reason in reasons[:3]))
+                    if st.button(
+                        "Guardar también en Mis operaciones",
+                        key=f"save_auto_signal_{signal['id']}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            saved = save_automatic_signal_to_operations(signal)
+                            st.success(f"Se guardaron {saved} operación(es) en Mis operaciones.")
+                            st.rerun()
+                        except Exception as error:
+                            st.error(f"No se pudo guardar la operación: {error}")
+
+        with ranking_tab:
+            if not strategy_rows:
+                st.info("El ranking aparecerá cuando el escáner registre sus primeras ideas.")
+            else:
+                ranking = []
+                for row in strategy_rows:
+                    total_closed = int(row.get("closed") or 0)
+                    total_winners = int(row.get("winners") or 0)
+                    ranking.append(
+                        {
+                            "Estrategia": row["strategy"],
+                            "Ideas": int(row.get("total") or 0),
+                            "Abiertas": int(row.get("opened") or 0),
+                            "Cerradas": total_closed,
+                            "Ganadoras": total_winners,
+                            "Acierto %": (
+                                round(total_winners / total_closed * 100, 1)
+                                if total_closed else None
+                            ),
+                            "P&L realizado": round(float(row.get("realized_pnl") or 0), 2),
+                            "P&L activo": round(float(row.get("open_pnl") or 0), 2),
+                            "Confianza media": round(float(row.get("average_confidence") or 0), 1),
+                        }
+                    )
+                ranking_frame = pd.DataFrame(ranking).sort_values(
+                    ["P&L realizado", "Ganadoras", "Confianza media"],
+                    ascending=[False, False, False],
+                )
+                st.dataframe(ranking_frame, hide_index=True, use_container_width=True)
+                if len(ranking_frame) > 0:
+                    best = ranking_frame.iloc[0]
+                    st.success(
+                        f"Líder del día: {best['Estrategia']} · "
+                        f"resultado realizado {money(best['P&L realizado'])}."
+                    )
+
+        with history_tab:
+            if not all_statistics:
+                st.info("El historial se construye automáticamente a medida que pasan los días.")
+            else:
+                daily = pd.DataFrame(all_statistics)
+                daily_summary = daily.groupby("trading_day", as_index=False).agg(
+                    ideas=("total", "sum"),
+                    cerradas=("closed", "sum"),
+                    ganadoras=("winners", "sum"),
+                    resultado=("realized_pnl", "sum"),
+                    resultado_abierto=("open_pnl", "sum"),
+                )
+                daily_summary["acierto"] = daily_summary.apply(
+                    lambda row: round(float(row["ganadoras"]) / float(row["cerradas"]) * 100, 1)
+                    if float(row["cerradas"]) else None,
+                    axis=1,
+                )
+                display = daily_summary.rename(
+                    columns={
+                        "trading_day": "Fecha",
+                        "ideas": "Ideas",
+                        "cerradas": "Cerradas",
+                        "ganadoras": "Ganadoras",
+                        "resultado": "P&L realizado",
+                        "resultado_abierto": "P&L abierto",
+                        "acierto": "Acierto %",
+                    }
+                ).sort_values("Fecha", ascending=False)
+                st.dataframe(display, hide_index=True, use_container_width=True)
+                chart_frame = daily_summary.set_index("trading_day")[["resultado"]]
+                st.bar_chart(chart_frame, use_container_width=True)
+                st.download_button(
+                    "Descargar historial en CSV",
+                    data=display.to_csv(index=False).encode("utf-8"),
+                    file_name=f"ideas_{symbol}_{market_time().date().isoformat()}.csv",
+                    mime="text/csv",
+                )
+
+            if closed:
+                st.markdown("#### Ideas cerradas del día seleccionado")
+                closed_rows = [
+                    {
+                        "Hora": str(signal.get("created_at") or "")[11:19],
+                        "Estrategia": signal["strategy"],
+                        "Strikes": automatic_signal_title(signal),
+                        "Resultado": round(float(signal.get("realized_pnl") or 0), 2),
+                        "Cierre": signal.get("close_reason") or "",
+                        "Vencimiento": signal["expiration"],
+                    }
+                    for signal in closed
+                ]
+                st.dataframe(pd.DataFrame(closed_rows), hide_index=True, use_container_width=True)
+
+        with context_tab:
+            first, second, third, fourth = st.columns(4)
+            first.metric(
+                "IV ATM",
+                f"{float(context['atm_iv']) * 100:.1f}%"
+                if context.get("atm_iv") is not None else "N/D",
+            )
+            second.metric(
+                "Imán gamma",
+                f"{float(context['gamma_magnet']):,.0f}"
+                if context.get("gamma_magnet") is not None else "N/D",
+            )
+            third.metric(
+                "MVS",
+                f"{float(context['mvs']):,.0f}" if context.get("mvs") is not None else "N/D",
+            )
+            fourth.metric("Régimen gamma", str(context.get("gamma_regime") or "N/D"))
+            first, second, third, fourth = st.columns(4)
+            first.metric(
+                "EMA 9", f"{float(context['ema9']):,.2f}"
+                if context.get("ema9") is not None else "N/D",
+            )
+            second.metric(
+                "EMA 21", f"{float(context['ema21']):,.2f}"
+                if context.get("ema21") is not None else "N/D",
+            )
+            third.metric(
+                "ATR 14", f"{float(context['atr14']):,.2f}"
+                if context.get("atr14") is not None else "N/D",
+            )
+            fourth.metric(
+                "VWAP", f"{float(context['vwap']):,.2f}"
+                if context.get("vwap") is not None else "Sin volumen",
+            )
+            if context.get("expected_lower") is not None:
+                st.info(
+                    f"Movimiento esperado: {float(context['expected_lower']):,.1f} — "
+                    f"{float(context['expected_upper']):,.1f}. "
+                    "La proyección es indicativa y no garantiza dirección ni beneficios."
+                )
+
+        if latest_scan:
+            st.caption(
+                f"Último escaneo: {str(latest_scan['scanned_at'])[11:19]} hora de Miami · "
+                f"nuevo escaneo cada {AUTO_IDEA_SCAN_SECONDS} segundos · "
+                f"panel actualizado cada {AUTO_IDEA_VIEW_REFRESH_SECONDS} segundos."
+            )
+        if configured_application_value("DATABASE_URL"):
+            st.caption("Base de datos: PostgreSQL persistente configurado.")
+        else:
+            st.caption(
+                "Base de datos: SQLite. En Streamlit Community Cloud el historial puede "
+                "reiniciarse al volver a desplegar; DATABASE_URL permite conservarlo permanentemente."
+            )
+        st.caption(
+            "Las señales son operaciones simuladas para evaluar estrategias. "
+            "No se envían órdenes al bróker ni se garantizan resultados."
+        )
+
+    use_fragment(ideas_panel, AUTO_IDEA_VIEW_REFRESH_SECONDS)
 
 
 elif page == "📊 Simulador de opciones":
@@ -3676,6 +5099,15 @@ elif page == "📊 Simulador de opciones":
                     "Personalizada",
                 ],
                 key="sim_strategy_visual",
+            )
+            live_market_premiums = st.toggle(
+                "Actualizar primas y créditos automáticamente",
+                value=True,
+                key="sim_live_market_premiums",
+                help=(
+                    "Utiliza las cotizaciones actuales de Tradier para recalcular "
+                    "las primas, el crédito o débito y la gráfica de la estrategia."
+                ),
             )
             strategy_key = re.sub(r"[^A-Za-z0-9_]", "_", simulated_strategy)
             component_key = f"live_builder_{selected_symbol()}_{strategy_key}"
@@ -3742,14 +5174,31 @@ elif page == "📊 Simulador de opciones":
                 )
                 previous_visual_selection = component_state_value(component_key, "selection", {})
                 initial_legs = apply_visual_selection(
-                    initial_legs, simulation_index, previous_visual_selection, simulated_expiration
+                    initial_legs,
+                    simulation_index,
+                    previous_visual_selection,
+                    simulated_expiration,
+                    live_quotes=live_market_premiums,
                 )
+                if live_market_premiums:
+                    initial_legs = synchronize_simulator_market_premiums(
+                        initial_legs, simulation_index
+                    )
             except Exception as error:
                 st.error(f"No se pudo preparar el simulador: {error}")
                 st.stop()
 
             st.markdown('<div class="sim-section-label">PATAS DE LA OPERACIÓN</div>', unsafe_allow_html=True)
-            st.caption("Edita el strike, la prima o los contratos. También puedes agregar o quitar patas.")
+            if live_market_premiums:
+                st.caption(
+                    f"Primas conectadas a Tradier: se actualizan cada "
+                    f"{LIVE_OPTION_CHAIN_REFRESH_SECONDS} segundos."
+                )
+            else:
+                st.caption(
+                    "Edita el strike, la prima o los contratos. "
+                    "También puedes agregar o quitar patas."
+                )
             editor_key = (
                 f"sim_visual_editor_{selected_symbol()}_{simulated_strategy}_{simulated_expiration}_"
                 f"{simulated_distance}_{simulated_width}_{simulated_contracts}_"
@@ -3761,6 +5210,7 @@ elif page == "📊 Simulador de opciones":
                 hide_index=True,
                 use_container_width=True,
                 key=editor_key,
+                disabled=["Prima"] if live_market_premiums else False,
                 column_config={
                     "Acción": st.column_config.SelectboxColumn(
                         "Acción", options=["COMPRAR", "VENDER"], required=True
@@ -3783,8 +5233,15 @@ elif page == "📊 Simulador de opciones":
             )
 
             try:
+                if live_market_premiums:
+                    edited_legs = synchronize_simulator_market_premiums(
+                        edited_legs, simulation_index
+                    )
                 simulation_legs = normalize_simulator_legs(
-                    edited_legs, simulation_index, simulation_expected.get("atm_iv")
+                    edited_legs,
+                    simulation_index,
+                    simulation_expected.get("atm_iv"),
+                    live_quotes=live_market_premiums,
                 )
             except Exception as error:
                 st.warning(f"Revisa la estrategia: {error}")
@@ -3862,6 +5319,7 @@ elif page == "📊 Simulador de opciones":
             simulation_expected,
             graph_range,
             previous_visual_selection,
+            live_quotes=live_market_premiums,
         )
         try:
             render_interactive_builder(visual_payload, component_key)
@@ -3871,12 +5329,25 @@ elif page == "📊 Simulador de opciones":
 
         st.markdown('<div class="sim-section-label">ESCENARIO Y PROYECCIÓN</div>', unsafe_allow_html=True)
         price_column, time_column, volatility_column = st.columns([1, 1, 1])
+        scenario_widget_key = f"sim_scenario_price_visual_{selected_symbol()}"
+        scenario_reference_key = f"sim_scenario_reference_{selected_symbol()}"
+        previous_reference = st.session_state.get(scenario_reference_key)
+        existing_scenario = st.session_state.get(scenario_widget_key)
+        rounded_simulation_spot = round(float(simulation_spx), 2)
+        if existing_scenario is None or (
+            live_market_premiums
+            and (
+                previous_reference is None
+                or abs(float(existing_scenario) - float(previous_reference)) < 0.011
+            )
+        ):
+            st.session_state[scenario_widget_key] = rounded_simulation_spot
+        st.session_state[scenario_reference_key] = rounded_simulation_spot
         scenario_price = price_column.number_input(
             f"Precio {selected_symbol()}",
             min_value=0.01,
-            value=float(round(simulation_spx, 2)),
             step=float(instrument_settings["step"]),
-            key=f"sim_scenario_price_visual_{selected_symbol()}",
+            key=scenario_widget_key,
         )
         if dte > 0:
             elapsed_days = time_column.slider(
@@ -3995,6 +5466,12 @@ elif page == "📊 Simulador de opciones":
         "Probabilidades, curvas y resultados son estimaciones teóricas basadas en volatilidad implícita, "
         "tiempo y tasa configurada. No garantizan precios de ejecución ni beneficios."
     )
+    if live_market_premiums:
+        st.caption(
+            f"Primas y créditos actualizados: {market_time().strftime('%I:%M:%S %p')} "
+            "hora de Miami."
+        )
+        schedule_live_page_refresh("simulator", AUTO_SIMULATOR_REFRESH_SECONDS)
 
 
 else:
@@ -4173,7 +5650,7 @@ else:
                     )
                     st.caption(
                         "La línea amarilla indica el precio al guardar la operación; "
-                        "la azul muestra el precio actual. Actualización automática cada 30 segundos."
+                        "la azul muestra el precio actual. Actualización automática cada 10 segundos."
                     )
 
                 with st.expander("✅ Registrar cierre de la operación"):
@@ -4220,9 +5697,9 @@ else:
                             request_trade_removal(trade_id, "closed")
                         render_trade_removal_confirmation(trade, "closed")
 
-        st.caption(f"Seguimiento actualizado: {datetime.now().strftime('%I:%M:%S %p')}")
+        st.caption(f"Seguimiento actualizado: {market_time().strftime('%I:%M:%S %p')}")
 
-    use_fragment(trades_panel, 30)
+    use_fragment(trades_panel, AUTO_ANALYZER_REFRESH_SECONDS)
 
 
 st.caption("SPX Defender analiza y registra operaciones. No envía órdenes al bróker.")
